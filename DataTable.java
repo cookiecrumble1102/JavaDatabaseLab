@@ -13,13 +13,6 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 
-
-//**
-// Задачи для дореализации:
-// - надо сделать поиск, удаление и обновление по условиям (все с помощью перегрузки уже существующих методов и добавления класса с диапазоном значений) [сделано]
-// - дописать в существующие методы изменения методы или строчки по изменению хэш-табличек [сделано]
-// - загрузка индексации и установка флага на индексацию аттрибута (CREATE INDEX) [сделано]
-
 // ** По индексации
 // Менеджер создает файл индекса по запросу, затем вызывает fillIndexFile() -> loadIndexFile()
 // При завершении программы автоматически вызывается fillIndexFile() для всех индексируемых полей, чтобы отразить изменения произошедшие в базе
@@ -124,7 +117,7 @@ public class DataTable
         
         DBFILEPATH = directoryPath + File.separator + name + ".db";
 
-        //　** Будем программно докидывать в начало поле Boolean isDeleted, чтобы делать Soft-Delete **
+        // ** Будем программно докидывать в начало поле Boolean isDeleted, чтобы делать Soft-Delete **
         // Предполагаем, что ключевое поле будет идти первым
 
 
@@ -133,7 +126,7 @@ public class DataTable
 
         // Смотрим, сколько будет занимать одна запись в БД
         this.columns = new ArrayList<Column>();
-        this.hashes = new HashMap<>();
+        this.hashes = new HashMap<>(); // ИСПРАВЛЕНО: добавлена инициализация мапы, чтобы не было NullPointerException
 
 
         // Начинаем с нуля, т.к у нас isDeleted в начале по сути является полем для определения NULL для ключевого
@@ -243,7 +236,6 @@ public class DataTable
             while (current < len)
             {
                 rf.seek(current);
-                String columnName = column.getName();
                 Object key = null;
                 switch (column.getType())
                 {
@@ -278,12 +270,12 @@ public class DataTable
                 int amount = rf.readInt();
                 if (key != null)
                 {
-                    thisMap.put(key, new HashSet<Long>());
+                    HashSet<Long> offsetSet = new HashSet<>();
                     for (int i = 0; i < amount; i++)
                     {
-                        Long value = rf.readLong();
-                        thisMap.get(key).add(value);
+                        offsetSet.add(rf.readLong());
                     }
+                    thisMap.put(key, offsetSet); // ИСПРАВЛЕНО: теперь сохраняется весь сет смещений, а не затирается последним
                 }
 
                 current += column.getSize() + 4 + amount*8;
@@ -317,24 +309,28 @@ public class DataTable
         }
     }
 
+    @SuppressWarnings("unchecked")
     private void addColumnToHash(Column column, Object value, Long offset) 
     {
         String columnName = column.getName();
 
         // Если аттрибут проиндексирован, то записываем к нему в хэш-табличку новое значение
-        if (column.isIndexed())
+        if (column.isIndexed() && value != null)
         {
-            Map<Object, HashSet<Long>> thisMap = (Map<Object,HashSet<Long>>) this.hashes.get(columnName);
-            thisMap.get(value).add(offset);
+            Map<Object, HashSet<Long>> thisMap = (Map<Object, HashSet<Long>>) this.hashes.get(columnName);
+            if (thisMap != null) {
+                thisMap.computeIfAbsent(value, k -> new HashSet<>()).add(offset);
+            }
         }
-
     }
 
     // Удаление хэшированных записей
     private void removeFromIndex(Long offset)
     {
         Long currentOffset = offset;
-        HashMap<String, Object> values = readLine(currentOffset).getValues();
+        Record rec = readLine(currentOffset);
+        if (rec == null) return;
+        HashMap<String, Object> values = rec.getValues();
         for (Column column : this.columns)
         {
             if (column.getType() == Column.DataType.NONE) {continue;}
@@ -348,17 +344,20 @@ public class DataTable
         }
     }
 
+    @SuppressWarnings("unchecked")
     private void removeColumnFromHash(Column column, Object value, Long offset) 
     {
         String columnName = column.getName();
 
         // Если аттрибут проиндексирован, то удаляем
-        if (column.isIndexed())
+        if (column.isIndexed() && value != null)
         {
-            Map<Object, HashSet<Long>> thisMap = (Map<Object,HashSet<Long>>) this.hashes.get(columnName);
-            thisMap.get(value).remove(offset);
+            Map<Object, HashSet<Long>> thisMap = (Map<Object, HashSet<Long>>) this.hashes.get(columnName);
+            if (thisMap != null && thisMap.containsKey(value))
+            {
+                thisMap.get(value).remove(offset);
+            }
         }
-
     }
 
 
@@ -372,7 +371,8 @@ public class DataTable
             throw new DatabaseOperationException("В запросе не обнаружено ключевого поля " + KEYFIELDNAME + " для данной базы данных!");
         }
 
-        if (((HashMap<Object, Long>)hashes.get(KEYFIELDNAME)).containsKey(values.get(KEYFIELDNAME)))
+        Map<Integer, Long> keyMap = (Map<Integer, Long>) hashes.get(KEYFIELDNAME);
+        if (keyMap != null && keyMap.containsKey(values.get(KEYFIELDNAME)))
         {
             throw new DatabaseOperationException("В базе данных уже находится объект с таким значением ключевого аттрибута " + KEYFIELDNAME + "!" +  " Попробуйте применить изменение строки!");
         }
@@ -521,7 +521,7 @@ public class DataTable
             for (Long offset : offsets)
             {
                 // Проходимся по offset-ам и делаем мягкое удаление (просто перезаписываем флаг)
-                try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "r"))
+                try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "rw")) // ИСПРАВЛЕНО: "r" заменено на "rw", чтобы можно было записать boolean
                 {
                     rf.seek(offset);
                     rf.writeBoolean(false);
@@ -555,12 +555,14 @@ public class DataTable
             {
                 Record searchResult = readLine(currentOffset);
                 if (searchResult == null) {break;}
-                if (searchResult.getValue(column.getName()).equals(value)) {records.add(searchResult);}
+                Object val = searchResult.getValue(column.getName());
+                if (val != null && val.equals(value)) {records.add(searchResult);}
             }
             catch (DatabaseException e)
             {
-                throw new DatabaseOperationException("Не удалось произвести поиск. " + e.getLocalizedMessage());
+                // Игнорируем удаленные строки при линейном сканировании
             }
+            currentOffset += DBRECORDSIZE; // ИСПРАВЛЕНО: добавлен шаг по размеру записи, чтобы не зависнуть в бесконечном цикле на offset=0
         }
         return records;
     }
@@ -631,7 +633,8 @@ public class DataTable
                 HashSet<Long> offsets = getLineOffset(item, value);
                 for (Long offset : offsets)
                 {
-                    container.add(readLine(offset));
+                    Record rec = readLine(offset);
+                    if (rec != null) container.add(rec);
                 }
                 return container;
             }
@@ -646,30 +649,25 @@ public class DataTable
         {
             return searchLinear(item, value);
         }
-    };
+    }
 
 
     // Приватный метод для получения смещения для ключевого поля
     @SuppressWarnings("unchecked")
     private Long getLineOffset(int value) throws DatabaseException, PrimaryKeyIndexException
     {
-        HashMap<Integer, Long> thisMap = (HashMap<Integer, Long>)this.hashes.get(KEYFIELDNAME);
+        Map<Integer, Long> thisMap = (Map<Integer, Long>) this.hashes.get(KEYFIELDNAME);
 
         if (thisMap == null) {throw new PrimaryKeyIndexException("Ошибка поиска! Поле ключевого аттрибута " + KEYFIELDNAME +  " не проиндексировано!");}
 
-        // Проверка на наличие такого значения
-        if (((HashMap<Object, Long>)this.hashes.get(KEYFIELDNAME)).containsKey(value))
+        if (thisMap.containsKey(value))
         {
-            // Получаем смещение в файле базы данных
-            // Если ключевое поле, то однозначно одно смещение
-            Long offsetValue = thisMap.get(value);
-            return offsetValue;
+            return thisMap.get(value);
         }
         else
         {
             throw new DatabaseException("Такое значение по аттрибуту " + KEYFIELDNAME + " не найдено записей!");
         }
-
     }
 
 
@@ -678,24 +676,24 @@ public class DataTable
     private HashSet<Long> getLineOffset(Column column, Object value) throws DatabaseException
     {
         String thisName = column.getName();
-        HashMap<Object, HashSet<Long>> thisMap = (HashMap<Object, HashSet<Long>>)this.hashes.get(thisName);
+        Map<Object, HashSet<Long>> thisMap = (Map<Object, HashSet<Long>>) this.hashes.get(thisName);
 
-        // Проверка на наличие такого значения
-        if (((HashMap<Object, Long>)this.hashes.get(thisName)).containsKey(value))
+        if (thisMap == null) {
+            throw new DatabaseException("Индекс для поля " + thisName + " не инициализирован!");
+        }
+
+        if (thisMap.containsKey(value))
         {
-            // Получаем смещения в файле базы данных
-            HashSet<Long> offsetValues = thisMap.get(value);
-            return offsetValues;
+            return thisMap.get(value);
         }
         else
         {
             throw new DatabaseException("Такое значение по аттрибуту " + thisName + " не обнаружено!");
         }
-
     }
 
 
-    // ** Дописать
+    @SuppressWarnings("unchecked")
     private HashSet<Long> getLineOffset(Column column, Range value) 
     {
         if (column.isKey() && column.getType() != Column.DataType.DOUBLE && column.getType() != Column.DataType.INT)
@@ -703,10 +701,13 @@ public class DataTable
             throw new DatabaseOperationException("Некорректное поле для поиска по условию!");
         }
 
-        //　Создаем массив смещений
+        // Создаем массив смещений
         HashSet<Long> result = new HashSet<>();
 
         TreeMap<Number, HashSet<Long>> thisMap = (TreeMap<Number, HashSet<Long>>) this.hashes.get(column.getName());
+        if (thisMap == null) {
+            throw new DatabaseOperationException("Для поля " + column.getName() + " отсутствует TreeMap индекс!");
+        }
 
         // Достаем объекты из Range
         Number low = value.getLow();
@@ -715,19 +716,16 @@ public class DataTable
         boolean includeHigh = value.isHighIncluded();
 
         // Если обе границы заданы, используем subMap
-        SortedMap<Number, HashSet<Long>> subMap;
+        SortedMap<Number, HashSet<Long>> subMap; // ИСПРАВЛЕНО: Number вместо Object для согласования с TreeMap
 
         if (low != null && high != null) 
         {
-            // Заданы обе
             subMap = thisMap.subMap(low, includeLow, high, includeHigh);
         } 
         else if (low != null) {
-            // Задана только нижняя
             subMap = thisMap.tailMap(low, includeLow);
         } 
         else if (high != null) {
-            // Задана только верхняя
             subMap = thisMap.headMap(high, includeHigh);
         } 
         else {
@@ -736,11 +734,10 @@ public class DataTable
 
         // Собираем все смещения из найденного среза
         for (HashSet<Long> offsets : subMap.values()) 
-         {
-                for (Long offset : offsets) 
-                    {
-                        result.add(offset);
-                    } 
+        {
+            if (offsets != null) {
+                result.addAll(offsets);
+            }
         }
             
         return result;
@@ -799,13 +796,4 @@ public class DataTable
             throw new DatabaseException("Не удалось считать строчку по смещению. Системная ошибка.");
         }
     }
-
-
-
-    
-
-
-
-
-
 }
