@@ -295,31 +295,40 @@ public class DataTable
     // Добавление хэшированных записей
     private void addToIndex(HashMap<String, Object> values, Long offset)
     {
-        Long currentOffset = offset;
         for (Column column : this.columns)
         {
-            if (column.getType() == Column.DataType.NONE) {continue;}
+            if (column.getType() == Column.DataType.NONE) {
+                continue;
+            }
 
             String columnName = column.getName();
-            Object searchResult = values.get(columnName);
+            Object value = values.get(columnName);
 
-            // Добавляем по отдельности
-            addColumnToHash(column, searchResult, currentOffset);
-            currentOffset += column.getSize();
+            addColumnToHash(column, value, offset);
         }
     }
 
     @SuppressWarnings("unchecked")
-    private void addColumnToHash(Column column, Object value, Long offset) 
+    private void addColumnToHash(Column column, Object value, Long offset)
     {
+        if (!column.isIndexed() || value == null) {
+            return;
+        }
+
         String columnName = column.getName();
 
-        // Если аттрибут проиндексирован, то записываем к нему в хэш-табличку новое значение
-        if (column.isIndexed() && value != null)
-        {
-            Map<Object, HashSet<Long>> thisMap = (Map<Object, HashSet<Long>>) this.hashes.get(columnName);
-            if (thisMap != null) {
-                thisMap.computeIfAbsent(value, k -> new HashSet<>()).add(offset);
+        if (column.isKey()) {
+            Map<Integer, Long> keyMap = (Map<Integer, Long>) this.hashes.get(columnName);
+
+            if (keyMap != null) {
+                keyMap.put((Integer) value, offset);
+            }
+        }
+        else {
+            Map<Object, HashSet<Long>> indexMap = (Map<Object, HashSet<Long>>) this.hashes.get(columnName);
+
+            if (indexMap != null) {
+                indexMap.computeIfAbsent(value, k -> new HashSet<>()).add(offset);
             }
         }
     }
@@ -327,35 +336,56 @@ public class DataTable
     // Удаление хэшированных записей
     private void removeFromIndex(Long offset)
     {
-        Long currentOffset = offset;
-        Record rec = readLine(currentOffset);
-        if (rec == null) return;
+        Record rec = readLine(offset);
+
+        if (rec == null) {
+            return;
+        }
+
         HashMap<String, Object> values = rec.getValues();
+
         for (Column column : this.columns)
         {
-            if (column.getType() == Column.DataType.NONE) {continue;}
+            if (column.getType() == Column.DataType.NONE) {
+                continue;
+            }
 
             String columnName = column.getName();
-            Object searchResult = values.get(columnName);
+            Object value = values.get(columnName);
 
-            // Удаляем по отдельности
-            removeColumnFromHash(column, searchResult, currentOffset);
-            currentOffset += column.getSize();
+            removeColumnFromHash(column, value, offset);
         }
     }
 
     @SuppressWarnings("unchecked")
-    private void removeColumnFromHash(Column column, Object value, Long offset) 
+    private void removeColumnFromHash(Column column, Object value, Long offset)
     {
+        if (!column.isIndexed() || value == null) {
+            return;
+        }
+
         String columnName = column.getName();
 
-        // Если аттрибут проиндексирован, то удаляем
-        if (column.isIndexed() && value != null)
-        {
-            Map<Object, HashSet<Long>> thisMap = (Map<Object, HashSet<Long>>) this.hashes.get(columnName);
-            if (thisMap != null && thisMap.containsKey(value))
-            {
-                thisMap.get(value).remove(offset);
+        if (column.isKey()) {
+            Map<Integer, Long> keyMap = (Map<Integer, Long>) this.hashes.get(columnName);
+
+            if (keyMap != null) {
+                keyMap.remove((Integer) value);
+            }
+        }
+        else {
+            Map<Object, HashSet<Long>> indexMap = (Map<Object, HashSet<Long>>) this.hashes.get(columnName);
+
+            if (indexMap != null) {
+                HashSet<Long> offsets = indexMap.get(value);
+
+                if (offsets != null) {
+                    offsets.remove(offset);
+
+                    if (offsets.isEmpty()) {
+                        indexMap.remove(value);
+                    }
+                }
             }
         }
     }
@@ -754,12 +784,15 @@ public class DataTable
             if (offset >= rf.length()) {return null;}
 
             rf.seek(offset);
-            Boolean isDeleted = rf.readBoolean();
-            if (isDeleted == true) {throw new DatabaseException("Не удалось считать строчку по смещению. Строка была удалена.");}
+            boolean isAlive = rf.readBoolean();
+            if (!isAlive) {throw new DatabaseException("Не удалось считать строчку по смещению. Строка была удалена.");}
             HashMap<String, Object> values = new HashMap<>();
             for (Column column : this.columns)
             {
-                if (!column.isKey() && !rf.readBoolean()) {continue;}
+                if (!column.isKey() && !rf.readBoolean()) {
+                    rf.skipBytes(column.getSize());
+                    continue;
+                }
                 String columnName = column.getName();
                 switch (column.getType())
                 {
