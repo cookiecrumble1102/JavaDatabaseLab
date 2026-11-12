@@ -1,3 +1,5 @@
+
+
 public class Column
 {
     // За счет энума потом будет проще делать сравнения по типу
@@ -96,7 +98,7 @@ public class Column
     public DataType getType() {return this.type;}
     public int getSize() {return this.size;}
     public boolean isKey() {return this.isKey;}
-    public boolean getIndexed() {return this.isIndexed;}
+    public boolean isIndexed() {return this.isIndexed;}
 
     // Сеттеры
     public void setIndexed(boolean boolValue) {this.isIndexed = boolValue;}
