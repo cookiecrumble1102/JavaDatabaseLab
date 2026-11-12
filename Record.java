@@ -27,5 +27,10 @@ public class Record
         }
         return item;
     }
+
+    public HashMap<String, Object> getValues()
+    {
+        return this.values;
+    }
     
 }
