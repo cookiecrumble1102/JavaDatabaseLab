@@ -1,7 +1,9 @@
 
 
-public class Column
+public class Column implements java.io.Serializable
 {
+    private static final long serialVersionUID = 1L;
+
     // За счет энума потом будет проще делать сравнения по типу
     public enum DataType
     {
@@ -28,7 +30,24 @@ public class Column
     private int size;
     private boolean isIndexed = false;
     private boolean isKey = false;
+    private String referencedTable;
+    private String referencedColumn;
 
+    public void setReference(String tableName, String columnName)
+    {
+        this.referencedTable = tableName;
+        this.referencedColumn = columnName;
+    }
+
+    public String getReferencedTable()
+    {
+        return referencedTable;
+    }
+
+    public String getReferencedColumn()
+    {
+        return referencedColumn;
+    }
 
     // Конструктор по имени типа (все кроме STRING)
     public Column(String columnName, String typeName) throws IllegalArgumentException

@@ -12,6 +12,10 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 
 // ** По индексации
 // Менеджер создает файл индекса по запросу, затем вызывает fillIndexFile() -> loadIndexFile()
@@ -142,51 +146,40 @@ public class DataTable
         // Один раз перезаписываем final-поле, теперь работаем с ним
         DBRECORDSIZE = size;
 
+        validateDataFile();
 
         // Задаем первое поле ключевым
         this.columns.get(0).setKey(true);
 
+        rebuildPrimaryKeyIndex();
 
-        // Здесь делаем проверку на наличие индексных файлов (какие существуют) и загружаем в оперативку
-        for (int columnIndex = 0; columnIndex < this.columns.size(); columnIndex++)
-        {
-            Column thisColumn = columns.get(columnIndex);
-            String columnName = thisColumn.getName();
-            String indexPath = directoryPath + File.separator + name + "_" + columnName + ".idx";
-            File currentFile = new File(indexPath);
-            if (currentFile.exists())
-            {
-                // Если поле является ключевым
-                if (columns.get(columnIndex).isKey())
-                {
-                    // Если не удалось сделать индексацию по ключевому полю, то выдаем ошибку
-                    try
-                    {
-                        loadKeyIndex(thisColumn, indexPath);
-                        KEYFIELDNAME = columnName;
-                    }
-                    catch (DatabaseException e)
-                    {
-                        System.err.println("Индексация ключевого поля не удалась!");
-                        throw new PrimaryKeyIndexException("Не удалось произвести индексацию ключевого поля " + columnName + "!");
-                    }
-                }
 
-                // Если поле не является ключевым
-                else
-                {
-                    // Если удалось загрузить индексный файл, то устанавливаем флаг индексации, иначе отправляем Warning и не индексируем по этому полю
-                    try
-                    {
-                        loadNonKeyIndex(thisColumn, indexPath);
-                        this.columns.get(columnIndex).setIndexed(true);
-                    }
-                    catch (DatabaseException e)
-                    {
-                        System.err.println("Индексация поля не удалась!");
-                    }
-                }
+        for (Column column : this.columns){
+            // Первичный индекс уже восстановлен из файла данных.
+            if (column.isKey()) {
+                continue;
             }
+
+            column.setIndexed(false);
+
+            String indexPath = directoryPath + File.separator + name + "_" + column.getName() + ".idx";
+
+            File indexFile = new File(indexPath);
+
+            if (!indexFile.exists()) {
+                continue;
+            }
+
+            try{
+                loadNonKeyIndex(column, indexPath);
+            }
+            catch (DatabaseException e){
+                this.hashes.remove(column.getName());
+                column.setIndexed(false);
+
+                System.err.println("Не удалось загрузить индекс столбца "+ column.getName()+ ": " + e.getMessage());
+            }
+            verifyNonKeyIndex(column);
         }
     }
 
@@ -227,7 +220,7 @@ public class DataTable
     // Формат хранения в файле [Значение] [INT кол-во записей] [Набор Long смещений]
     public void loadNonKeyIndex(Column column, String filePath) 
     {
-        try (RandomAccessFile rf = new RandomAccessFile(filePath, "rw"))
+        try (RandomAccessFile rf = new RandomAccessFile(filePath, "r"))
         {
             HashMap<Object, HashSet<Long>> thisMap = new HashMap<>();
 
@@ -254,20 +247,33 @@ public class DataTable
                     case DATE:
                         key = (Long) rf.readLong();
                         break;
-                    
+
                     case STRING:
                         byte[] nameBuffer = new byte[column.getSize()];
                         rf.readFully(nameBuffer);
-                        String name = new String(nameBuffer, StandardCharsets.UTF_8).trim();
+
+                        int end = nameBuffer.length;
+
+                        // Убираем только нулевые байты заполнения в конце.
+                        while (end > 0 && nameBuffer[end - 1] == 0) {end--;}
+
+                        String name = new String(nameBuffer,0, end, StandardCharsets.UTF_8);
                         key = name;
                         break;
 
-                    default: 
-                        key = null;
-                        break;
+                    default:
+                        throw new IndexException("Неподдерживаемый тип столбца в индексе: "+ column.getType());
                 }
 
                 int amount = rf.readInt();
+
+                long remainingBytes = rf.length() - rf.getFilePointer();
+
+                // Одно смещение Long занимает 8 байт
+                if (amount < 0 || amount > remainingBytes / 8) {
+                    throw new IndexException("Повреждён индекс столбца "+ column.getName()+ ": некорректное количество смещений — "+ amount);
+                }
+
                 if (key != null)
                 {
                     HashSet<Long> offsetSet = new HashSet<>();
@@ -278,7 +284,7 @@ public class DataTable
                     thisMap.put(key, offsetSet); // ИСПРАВЛЕНО: теперь сохраняется весь сет смещений, а не затирается последним
                 }
 
-                current += column.getSize() + 4 + amount*8;
+                current = rf.getFilePointer();
 
             }
             this.hashes.put(column.getName(), thisMap);
@@ -357,6 +363,82 @@ public class DataTable
         }
     }
 
+    // Проверка на корректность данных
+    private void validateValues(HashMap<String, Object> values)
+    {
+        if (values == null) {
+            throw new DatabaseOperationException("Не переданы значения записи!");
+        }
+
+        // Проверяем, что переданы только существующие столбцы.
+        for (String name : values.keySet()){
+            boolean found = false;
+
+            for (Column column : this.columns){
+                if (column.getName().equals(name)) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                throw new DatabaseOperationException("Неизвестный столбец: " + name);
+            }
+        }
+
+        // Проверяем значения всех столбцов.
+        for (Column column : this.columns){
+            Object value = values.get(column.getName());
+
+            if (value == null)
+            {
+                if (column.isKey()) {
+                    throw new DatabaseOperationException(
+                            "Первичный ключ не может быть NULL!"
+                    );
+                }
+
+                continue;
+            }
+
+            boolean valid;
+
+            switch (column.getType()){
+                case INT:
+                    valid = value instanceof Integer;
+                    break;
+
+                case DOUBLE:
+                    valid = value instanceof Double
+                            && Double.isFinite((Double) value);
+                    break;
+
+                case BOOLEAN:
+                    valid = value instanceof Boolean;
+                    break;
+
+                case DATE:
+                    valid = value instanceof Long;
+                    break;
+
+                case STRING:
+                    valid = value instanceof String
+                            && ((String) value).indexOf('\0') < 0
+                            && ((String) value)
+                            .getBytes(StandardCharsets.UTF_8).length
+                            <= column.getSize();
+                    break;
+
+                default:
+                    valid = false;
+            }
+
+            if (!valid) {
+                throw new DatabaseOperationException("Неверный тип или размер значения для столбца: " + column.getName());
+            }
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private void removeColumnFromHash(Column column, Object value, Long offset)
     {
@@ -390,11 +472,82 @@ public class DataTable
         }
     }
 
+    // Метод сохранения индексов
+    @SuppressWarnings("unchecked")
+    public void saveIndexes() {
+        String basePath = DBFILEPATH.substring(0,DBFILEPATH.length() - 3);
+
+        for (Column column : this.columns){
+            if (!column.isIndexed())
+                continue;
+
+
+            Object index = this.hashes.get(column.getName());
+
+            if (index == null) {
+                throw new IndexException("Не найден индекс столбца: " + column.getName());
+            }
+
+            Path indexPath = Paths.get(basePath + "." + column.getName() + ".idx");
+
+            Path tempPath = Paths.get(indexPath.toString() + ".tmp");
+
+            try{
+                // Основной индекс пока не трогаем
+                try (RandomAccessFile rf =new RandomAccessFile(tempPath.toFile(), "rw")){
+                    rf.setLength(0);
+
+                    if (column.isKey()){
+                        Map<Integer, Long> keyMap = (Map<Integer, Long>) index;
+
+                        for (Map.Entry<Integer, Long> entry : keyMap.entrySet()){
+                            rf.writeInt(entry.getKey());
+                            rf.writeLong(entry.getValue());
+                        }
+                    }
+                    else{
+                        Map<Object, HashSet<Long>> indexMap = (Map<Object, HashSet<Long>>) index;
+
+                        for (Map.Entry<Object, HashSet<Long>> entry : indexMap.entrySet()){
+                            writeColumn(column, entry.getKey(), rf);
+
+                            rf.writeInt(entry.getValue().size());
+
+                            for (Long offset : entry.getValue()) {
+                                rf.writeLong(offset);
+                            }
+                        }
+                    }
+
+                    // Сохраняем содержимое временного файла на диск
+                    rf.getFD().sync();
+                }
+
+                // Файл уже закрыт — заменяем основной индекс
+                Files.move(
+                        tempPath,
+                        indexPath,
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING
+                );
+            }
+            catch (IOException e)
+            {
+                throw new FileIntegrityException(
+                        "Не удалось сохранить индекс "
+                                + column.getName()
+                                + ": " + e.getMessage()
+                );
+            }
+        }
+    }
 
     // Вставка записи
     @SuppressWarnings("unchecked")
     public void insertLine(HashMap<String, Object> values) throws DatabaseOperationException
     {
+        validateValues(values);
+
         // Заранее проверяем крайние случаи, при возникновении которых мы просто не можем выполнять операцию вставки
         if (values.get(KEYFIELDNAME) == null)
         {
@@ -478,12 +631,24 @@ public class DataTable
                 case DATE:
                     rf.writeLong((Long) value);
                     break;
-                
+
                 case STRING:
-                    byte[] stringBytes = ((String) value).getBytes(StandardCharsets.UTF_8);
+                    String text = (String) value;
+
+                    // Нулевой символ используется для заполнения пустого места.
+                    if (text.indexOf('\0') >= 0) {
+                        throw new DatabaseOperationException("Строка не должна содержать нулевой символ!");
+                    }
+
+                    byte[] stringBytes = text.getBytes(StandardCharsets.UTF_8);
+
+                    if (stringBytes.length > item.getSize()) {
+                        throw new DatabaseOperationException("Строка слишком длинная для столбца " + item.getName() + ": допустимо " + item.getSize() + " байт, получено " + stringBytes.length);
+                    }
+
                     byte[] stringBuffer = new byte[item.getSize()];
 
-                    System.arraycopy(stringBytes, 0, stringBuffer, 0, Math.min(stringBytes.length, item.getSize()));
+                    System.arraycopy(stringBytes,0,stringBuffer,0,stringBytes.length);
 
                     rf.write(stringBuffer);
                     break;
@@ -499,73 +664,190 @@ public class DataTable
     }
 
     // Обновление строк
-    public void updateLine(Column column, Object value)
+    public void updateLine(
+            Column searchColumn,
+            Object searchValue,
+            Column targetColumn,
+            Object newValue)
     {
-        // Заранее узнаем нужный оффсет для изменения
-        Long columnOffset = 0L;
-        Boolean wasFound = false;
-        for (Column cl : this.columns)
+        // Находим реальные столбцы таблицы.
+        Column actualSearchColumn = null;
+        Column actualTargetColumn = null;
+
+        // Смещение изменяемого поля относительно начала строки.
+        long targetColumnOffset = 0;
+        long currentColumnOffset = 0;
+
+        for (Column column : this.columns)
         {
-            if (cl.getName().equals(column.getName()))
-            {
-                wasFound = true;
-                break;
+            if (column.getName().equals(searchColumn.getName())) {
+                actualSearchColumn = column;
             }
-            columnOffset += cl.getSize()+1;
+
+            if (column.getName().equals(targetColumn.getName()))
+            {
+                actualTargetColumn = column;
+                targetColumnOffset = currentColumnOffset;
+            }
+
+            // Один байт флага + байты значения.
+            currentColumnOffset += column.getSize() + 1;
         }
 
-        if (!wasFound) {throw new DatabaseOperationException("Не найдено аттрибута для удаления данных!");}
+        if (actualSearchColumn == null || actualTargetColumn == null) {
+            throw new DatabaseOperationException(
+                    "Столбец поиска или изменения не найден!"
+            );
+        }
 
-        try
+        if (actualTargetColumn.isKey()) {
+            throw new DatabaseOperationException(
+                    "Изменение первичного ключа пока не поддерживается!"
+            );
+        }
+
+        // Проверяем значение до изменения файла.
+        if (newValue != null)
         {
-            HashSet<Long> offsets = getLineOffset(column, value);
-            for (Long offset : offsets)
-            {
-                // Проходимся по offset-ам и меняем значение
-                try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "rw"))
-                {
-                    rf.seek(offset+columnOffset);
-                    removeColumnFromHash(column, value, offset+columnOffset);
-                    writeColumn(column, value, rf);
-                    addColumnToHash(column, value, offset+columnOffset);
+            boolean valid;
 
+            switch (actualTargetColumn.getType())
+            {
+                case INT:
+                    valid = newValue instanceof Integer;
+                    break;
+
+                case DOUBLE:
+                    valid = newValue instanceof Double
+                            && Double.isFinite((Double) newValue);
+                    break;
+
+                case BOOLEAN:
+                    valid = newValue instanceof Boolean;
+                    break;
+
+                case DATE:
+                    valid = newValue instanceof Long;
+                    break;
+
+                case STRING:
+                    valid = newValue instanceof String
+                            && ((String) newValue).indexOf('\0') < 0
+                            && ((String) newValue)
+                            .getBytes(StandardCharsets.UTF_8).length
+                            <= actualTargetColumn.getSize();
+                    break;
+
+                default:
+                    valid = false;
+            }
+
+            if (!valid) {
+                throw new DatabaseOperationException(
+                        "Неверный тип или размер нового значения!"
+                );
+            }
+        }
+
+        try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "rw"))
+        {
+            long fileLength = rf.length();
+
+            for (long rowOffset = 0;
+                 rowOffset < fileLength;
+                 rowOffset += DBRECORDSIZE)
+            {
+                // Пропускаем удалённые строки.
+                rf.seek(rowOffset);
+
+                if (!rf.readBoolean()) {
+                    continue;
                 }
-                catch (IOException e)
-                {
-                    throw new DatabaseOperationException("Не удалось произвести удаление! " + e.getLocalizedMessage());
-                }    
+
+                Record record = readLine(rowOffset);
+
+                Object currentSearchValue = record.getValues()
+                        .get(actualSearchColumn.getName());
+
+                // Обычное SQL-сравнение "=" не выбирает NULL.
+                if (currentSearchValue == null || searchValue == null) {
+                    continue;
+                }
+
+                boolean matches;
+
+                if (searchValue instanceof Range){
+                    Range<?> range = (Range<?>) searchValue;
+
+                    matches = currentSearchValue instanceof Number
+                            && range.checkCondition((Number) currentSearchValue);
+                }
+                else{
+                    matches = currentSearchValue.equals(searchValue);
+                }
+
+                if (!matches) {
+                    continue;
+                }
+
+                Object oldValue = record.getValues()
+                        .get(actualTargetColumn.getName());
+
+                // Переходим к флагу изменяемого поля.
+                rf.seek(rowOffset + targetColumnOffset);
+
+                rf.writeBoolean(newValue != null);
+
+                if (newValue == null) {
+                    rf.write(new byte[actualTargetColumn.getSize()]);
+                } else {
+                    writeColumn(actualTargetColumn, newValue, rf);
+                }
+
+                // В индексах всегда используем начало всей строки.
+                removeColumnFromHash(
+                        actualTargetColumn,
+                        oldValue,
+                        rowOffset
+                );
+
+                addColumnToHash(
+                        actualTargetColumn,
+                        newValue,
+                        rowOffset
+                );
             }
         }
-        catch (DatabaseException e)
+        catch (IOException e)
         {
-            throw new DatabaseOperationException("Не найдено данных для удаления!");
+            throw new DatabaseOperationException(
+                    "Не удалось обновить записи: " + e.getMessage()
+            );
         }
     }
 
     // Удаление строк
     public void deleteLine(Column column, Object value)
     {
-        try
-        {
-            HashSet<Long> offsets = getLineOffset(column, value);
-            for (Long offset : offsets)
-            {
-                // Проходимся по offset-ам и делаем мягкое удаление (просто перезаписываем флаг)
-                try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "rw")) // ИСПРАВЛЕНО: "r" заменено на "rw", чтобы можно было записать boolean
-                {
-                    rf.seek(offset);
-                    rf.writeBoolean(false);
-                    removeFromIndex(offset);
-                }
-                catch (IOException e)
-                {
-                    throw new DatabaseOperationException("Не удалось произвести удаление! " + e.getLocalizedMessage());
-                }    
+        HashSet<Long> offsets = new HashSet<>(getLineOffset(column, value));
+
+        // Ничего не найдено — удалять нечего
+        if (offsets.isEmpty())
+            return;
+
+        try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "rw")){
+            for (Long offset : offsets){
+                // Читаем ещё существующую строку
+                // и удаляем её смещения из индексов
+                removeFromIndex(offset);
+
+                // Затем помечаем саму строку удалённой
+                rf.seek(offset);
+                rf.writeBoolean(false);
             }
         }
-        catch (DatabaseException e)
-        {
-            throw new DatabaseOperationException("Не найдено данных для удаления!");
+        catch (IOException e){
+            throw new FileIntegrityException("Ошибка записи при удалении: " + e.getMessage());
         }
     }
 
@@ -574,26 +856,54 @@ public class DataTable
 
     // Линейный поиск по базе данных
     // Не делаем публичным, т.к всегда стараемся проводить индексируемый поиск, а не линейным
-    private HashSet<Record> searchLinear(Column column, Object value)
-    {
-        // Проходится по файлу БД и выдает нужные строчки
-        Long currentOffset = 0L;
+    private HashSet<Record> searchLinear(Column column, Object value) {
         HashSet<Record> records = new HashSet<>();
-        while (true)
-        {
-            try
-            {
-                Record searchResult = readLine(currentOffset);
-                if (searchResult == null) {break;}
-                Object val = searchResult.getValue(column.getName());
-                if (val != null && val.equals(value)) {records.add(searchResult);}
+
+        try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "r"))        {
+            long fileLength = rf.length();
+
+            for (long offset = 0; offset < fileLength; offset += DBRECORDSIZE)            {
+                rf.seek(offset);
+
+                // Пропускаем удалённые строки.
+                if (!rf.readBoolean())
+                    continue;
+
+                Record record = readLine(offset);
+
+                // В отличие от getValue(), возвращает null без исключения.
+                Object actualValue = record.getValues().get(column.getName());
+
+                if (actualValue == null || value == null)
+                    continue;
+
+
+                boolean matches;
+
+                if (value instanceof Range){
+                    if (!(actualValue instanceof Number)){
+                        throw new DatabaseOperationException("Числовой диапазон нельзя применить к столбцу "+ column.getName());
+                    }
+
+                    Range<?> range = (Range<?>) value;
+
+                    matches = range.checkCondition(
+                            (Number) actualValue
+                    );
+                }
+                else{
+                    matches = actualValue.equals(value);
+                }
+
+                if (matches) {
+                    records.add(record);
+                }
             }
-            catch (DatabaseException e)
-            {
-                // Игнорируем удаленные строки при линейном сканировании
-            }
-            currentOffset += DBRECORDSIZE; // ИСПРАВЛЕНО: добавлен шаг по размеру записи, чтобы не зависнуть в бесконечном цикле на offset=0
         }
+        catch (IOException e){
+            throw new FileIntegrityException("Ошибка чтения таблицы: " + e.getMessage());
+        }
+
         return records;
     }
     
@@ -602,38 +912,39 @@ public class DataTable
     // Индексированные функции поиска
 
     // Общая функция поиска в базе данных
-    public HashSet<Record> searchLine(Column column, Object value) throws DatabaseOperationException
+    public HashSet<Record> searchLine(Column column, Object value)
     {
-        
-        if (column.isKey())
-        {
-            HashSet<Record> result = new HashSet<>();
-            if (column.getType() != Column.DataType.INT) {throw new DatabaseOperationException("Ключевое поле таблицы инициализировано опасным типом данных. Поиск не может быть произведен.");}
-            if (!(value instanceof Integer)) {throw new DatabaseOperationException("Передано неверное значение для поиска по ключевому полю. Поиск не может быть произведен.");}
+        // Проверяем запрос диапазона.
+        if (value instanceof Range){
+            if (column.getType() != Column.DataType.INT
+                    && column.getType() != Column.DataType.DOUBLE) {
+                throw new DatabaseOperationException(
+                        "Числовой диапазон поддерживается только для INT и DOUBLE!"
+                );
+            }
+        }
+        else if (column.isKey() && value != null && !(value instanceof Integer)){
+            throw new DatabaseOperationException("Значение первичного ключа должно быть Integer!");
+        }
 
-            result.add(searchByKeyValue((Integer) value));
-            return result;
+        // Если индекса нет — просматриваем строки файла.
+        if (!column.isIndexed()) {
+            return searchLinear(column, value);
         }
-        else
-        {
-            // Если требуется выполнить поиск по Range
-            if (value instanceof Range)
-            {
-                try
-                {
-                    Range<?> searchRange = (Range<?>) value;
-                    return searchByNonKeyValue(column, searchRange);
-                }
-                catch (DatabaseException e)
-                {
-                    throw new DatabaseOperationException("Попытка произвести условный поиск для неподходящего типа данных!" + " " + e.getLocalizedMessage());
-                }
-            }
-            else
-            {
-                return searchByNonKeyValue(column, value);
+
+        // Если индекс есть — получаем смещения подходящих строк.
+        HashSet<Long> offsets = getLineOffset(column, value);
+        HashSet<Record> result = new HashSet<>();
+
+        for (Long offset : offsets){
+            Record record = readLine(offset);
+
+            if (record != null) {
+                result.add(record);
             }
         }
+
+        return result;
     }
 
     // Метод для поиска по ключевому значению
@@ -703,76 +1014,327 @@ public class DataTable
 
     // Приватный метод для получения смещения через хэш-таблицу для неключевого поля (не по условиям)
     @SuppressWarnings("unchecked")
-    private HashSet<Long> getLineOffset(Column column, Object value) throws DatabaseException
+    private HashSet<Long> getLineOffset(Column column, Object value)
     {
-        String thisName = column.getName();
-        Map<Object, HashSet<Long>> thisMap = (Map<Object, HashSet<Long>>) this.hashes.get(thisName);
-
-        if (thisMap == null) {
-            throw new DatabaseException("Индекс для поля " + thisName + " не инициализирован!");
+        if (value instanceof Range) {
+            return getLineOffset(column, (Range<?>) value);
         }
 
-        if (thisMap.containsKey(value))
-        {
-            return thisMap.get(value);
+        HashSet<Long> result = new HashSet<>();
+        String columnName = column.getName();
+
+        // Обычное сравнение "=" не выбирает NULL.
+        if (value == null) {
+            return result;
         }
-        else
-        {
-            throw new DatabaseException("Такое значение по аттрибуту " + thisName + " не обнаружено!");
+
+        // Поиск по первичному ключу.
+        if (column.isKey()){
+            Map<Integer, Long> keyMap =
+                    (Map<Integer, Long>) this.hashes.get(columnName);
+
+            if (keyMap == null) {
+                throw new PrimaryKeyIndexException(
+                        "Не найден индекс первичного ключа: " + columnName
+                );
+            }
+
+            if (!(value instanceof Integer)) {
+                throw new DatabaseOperationException(
+                        "Значение первичного ключа должно быть Integer!"
+                );
+            }
+
+            Long offset = keyMap.get((Integer) value);
+
+            if (offset != null) {
+                result.add(offset);
+            }
+
+            return result;
         }
+
+        // Поиск по обычному индексированному столбцу.
+        if (column.isIndexed()){
+            Map<Object, HashSet<Long>> indexMap =
+                    (Map<Object, HashSet<Long>>) this.hashes.get(columnName);
+
+            if (indexMap == null) {
+                throw new IndexException(
+                        "Не найден индекс столбца: " + columnName
+                );
+            }
+
+            HashSet<Long> offsets = indexMap.get(value);
+
+            if (offsets != null) {
+                result.addAll(offsets);
+            }
+
+            return result;
+        }
+
+        //Индекса нет — просматриваем файл.
+        try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "r")){
+            long fileLength = rf.length();
+
+            for (long offset = 0;
+                 offset < fileLength;
+                 offset += DBRECORDSIZE)
+            {
+                rf.seek(offset);
+
+                // Первый байт: существует ли строка.
+                if (!rf.readBoolean()) {
+                    continue;
+                }
+
+                Record record = readLine(offset);
+                Object actualValue = record.getValues().get(columnName);
+
+                if (value.equals(actualValue)) {
+                    result.add(offset);
+                }
+            }
+        }
+        catch (IOException e)
+        {
+            throw new FileIntegrityException("Ошибка чтения таблицы: " + e.getMessage());
+        }
+
+        return result;
     }
 
 
     @SuppressWarnings("unchecked")
-    private HashSet<Long> getLineOffset(Column column, Range value) 
+    private HashSet<Long> getLineOffset(Column column, Range<?> range)
     {
-        if (column.isKey() && column.getType() != Column.DataType.DOUBLE && column.getType() != Column.DataType.INT)
-        {
-            throw new DatabaseOperationException("Некорректное поле для поиска по условию!");
+        if (column.isKey()){
+            Map<Integer, Long> keyMap = (Map<Integer, Long>) this.hashes.get(column.getName());
+
+            if (keyMap == null) {
+                throw new PrimaryKeyIndexException("Не найден индекс первичного ключа: " + column.getName());
+            }
+
+            HashSet<Long> result = new HashSet<>();
+
+            for (Map.Entry<Integer, Long> entry : keyMap.entrySet()){
+                Integer id = entry.getKey();
+                Long offset = entry.getValue();
+
+                if (range.checkCondition(id)) {
+                    result.add(offset);
+                }
+            }
+
+            return result;
         }
 
-        // Создаем массив смещений
+        if (column.getType() != Column.DataType.INT && column.getType() != Column.DataType.DOUBLE) {
+            throw new DatabaseOperationException(
+                    "Числовой диапазон поддерживается только для INT и DOUBLE!"
+            );
+        }
+
+        if (!column.isIndexed()){
+            HashSet<Long> result = new HashSet<>();
+
+            try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "r")){
+                long fileLength = rf.length();
+
+                for (long offset = 0; offset < fileLength; offset += DBRECORDSIZE){
+                    rf.seek(offset);
+
+                    // Пропускаем удалённые строки.
+                    if (!rf.readBoolean()) {
+                        continue;
+                    }
+
+                    Record record = readLine(offset);
+
+                    Object actualValue = record.getValues().get(column.getName());
+
+                    // NULL не входит в числовой диапазон.
+                    if (actualValue == null) {
+                        continue;
+                    }
+
+                    if (range.checkCondition((Number) actualValue)) {
+                        result.add(offset);
+                    }
+                }
+            }
+            catch (IOException e){
+                throw new FileIntegrityException("Ошибка чтения таблицы: " + e.getMessage());
+            }
+
+            return result;
+        }
+
+        Map<Object, HashSet<Long>> indexMap = (Map<Object, HashSet<Long>>) this.hashes.get(column.getName());
+
+        if (indexMap == null) {
+            throw new IndexException(
+                    "Не найден индекс столбца: " + column.getName()
+            );
+        }
+
         HashSet<Long> result = new HashSet<>();
 
-        TreeMap<Number, HashSet<Long>> thisMap = (TreeMap<Number, HashSet<Long>>) this.hashes.get(column.getName());
-        if (thisMap == null) {
-            throw new DatabaseOperationException("Для поля " + column.getName() + " отсутствует TreeMap индекс!");
-        }
+        for (Map.Entry<Object, HashSet<Long>> entry : indexMap.entrySet()){
+            Number indexedValue = (Number) entry.getKey();
 
-        // Достаем объекты из Range
-        Number low = value.getLow();
-        Number high = value.getHigh();
-        boolean includeLow = value.isLowIncluded();
-        boolean includeHigh = value.isHighIncluded();
-
-        // Если обе границы заданы, используем subMap
-        SortedMap<Number, HashSet<Long>> subMap; // ИСПРАВЛЕНО: Number вместо Object для согласования с TreeMap
-
-        if (low != null && high != null) 
-        {
-            subMap = thisMap.subMap(low, includeLow, high, includeHigh);
-        } 
-        else if (low != null) {
-            subMap = thisMap.tailMap(low, includeLow);
-        } 
-        else if (high != null) {
-            subMap = thisMap.headMap(high, includeHigh);
-        } 
-        else {
-            throw new DatabaseException("Передан некорректный объект типа Range!");
-        }
-
-        // Собираем все смещения из найденного среза
-        for (HashSet<Long> offsets : subMap.values()) 
-        {
-            if (offsets != null) {
-                result.addAll(offsets);
+            if (range.checkCondition(indexedValue)) {
+                result.addAll(entry.getValue());
             }
         }
-            
+
         return result;
     }
-    
+
+    private void validateDataFile(){
+        if (DBRECORDSIZE <= 0) {
+            throw new FileIntegrityException("Некорректный размер записи: " + DBRECORDSIZE);
+        }
+
+        try (RandomAccessFile rf =new RandomAccessFile(DBFILEPATH, "r")){
+            long fileLength = rf.length();
+
+            if (fileLength % DBRECORDSIZE != 0) {
+                throw new FileIntegrityException("Файл таблицы содержит неполную запись. " + "Размер файла: " + fileLength + " байт, размер записи: " + DBRECORDSIZE + " байт.");
+            }
+        }
+        catch (IOException e)
+        {
+            throw new FileIntegrityException("Не удалось проверить файл таблицы: " + e.getMessage());
+        }
+    }
+
+    private void rebuildPrimaryKeyIndex(){
+        Column keyColumn = this.columns.get(0);
+        String keyName = keyColumn.getName();
+
+        HashMap<Integer, Long> keyMap = new HashMap<>();
+
+        try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "r")){
+            long fileLength = rf.length();
+
+            for (long offset = 0; offset < fileLength; offset += DBRECORDSIZE){
+                rf.seek(offset);
+
+                // Удалённые строки не включаем в индекс
+                if (!rf.readBoolean()) {
+                    continue;
+                }
+
+                // Первичный ключ находится сразу после флага
+                int id = rf.readInt();
+
+                if (keyMap.containsKey(id)) {
+                    throw new FileIntegrityException("В файле обнаружен повтор первичного ключа: " + id);
+                }
+
+                keyMap.put(id, offset);
+            }
+        }
+        catch (IOException e){
+            throw new FileIntegrityException("Не удалось восстановить первичный индекс: "+ e.getMessage());
+        }
+
+        // Устанавливаем индекс только после успешного чтения файла.
+        this.hashes.put(keyName, keyMap);
+        KEYFIELDNAME = keyName;
+        keyColumn.setIndexed(true);
+    }
+
+    private void verifyNonKeyIndex(Column column){
+        HashMap<Object, HashSet<Long>> expectedIndex = new HashMap<>();
+
+        try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "r")){
+            long fileLength = rf.length();
+
+            for (long offset = 0; offset < fileLength; offset += DBRECORDSIZE){
+                rf.seek(offset);
+
+                // Удалённые строки не индексируем.
+                if (!rf.readBoolean())
+                    continue;
+
+                Record record = readLine(offset);
+
+                Object value = record.getValues().get(column.getName());
+
+                // NULL в текущие индексы не записывается.
+                if (value == null)
+                    continue;
+
+                expectedIndex.computeIfAbsent(value, k -> new HashSet<>()).add(offset);
+            }
+        }
+        catch (IOException e){
+            throw new FileIntegrityException("Не удалось проверить индекс столбца "+ column.getName()+ ": " + e.getMessage());
+        }
+
+        Object loadedIndex = this.hashes.get(column.getName());
+
+        if (!expectedIndex.equals(loadedIndex)) {
+            this.hashes.put(column.getName(), expectedIndex);
+        }
+
+        column.setIndexed(true);
+    }
+
+    public HashSet<Record> selectAll(){
+        HashSet<Record> records = new HashSet<>();
+
+        try (RandomAccessFile rf = new RandomAccessFile(DBFILEPATH, "r")){
+            long fileLength = rf.length();
+
+            for (long offset = 0; offset < fileLength; offset += DBRECORDSIZE){
+                rf.seek(offset);
+
+                // Пропускаем удалённые строки
+                if (!rf.readBoolean())
+                    continue;
+
+                Record record = readLine(offset);
+                records.add(record);
+            }
+        }
+        catch (IOException e){
+            throw new FileIntegrityException("Не удалось прочитать таблицу: " + e.getMessage());
+        }
+
+        return records;
+    }
+
+    public Column getColumn(String columnName){
+        for (Column column : this.columns){
+            if (column.getName().equals(columnName)) {
+                return column;
+            }
+        }
+
+        throw new DatabaseOperationException("Столбец не найден: " + columnName);
+    }
+
+    public ArrayList<Column> getColumns()
+    {
+        return new ArrayList<>(this.columns);
+    }
+
+    public void createIndex(String columnName){
+        Column column = getColumn(columnName);
+
+        if (column.isIndexed()) {
+            throw new DatabaseOperationException("Столбец уже проиндексирован: " + columnName);
+        }
+
+        // Строит индекс по существующим строкам
+        // и устанавливает column.setIndexed(true)
+        verifyNonKeyIndex(column);
+    }
+
     // Ищем смещение -> кидаем в эту функцию
     // Считывает одну строку из файла по предоставленному смещению
     // Если смещение больше текущей длины возвращает null
@@ -815,7 +1377,13 @@ public class DataTable
                     case STRING:
                         byte[] nameBuffer = new byte[column.getSize()];
                         rf.readFully(nameBuffer);
-                        String name = new String(nameBuffer, StandardCharsets.UTF_8).trim();
+
+                        int end = nameBuffer.length;
+
+                        // Убираем только нулевые байты заполнения в конце.
+                        while (end > 0 && nameBuffer[end - 1] == 0) { end--; }
+
+                        String name = new String(nameBuffer, 0, end, StandardCharsets.UTF_8);
                         values.put(columnName, name);
                         break;
 
