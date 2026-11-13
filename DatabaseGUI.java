@@ -41,43 +41,9 @@ public class DatabaseGUI extends JFrame {
             JOptionPane.showMessageDialog(this, "Ошибка инициализации БД: " + e.getMessage());
         }
 
-        //Левая панель(Команды)
-        JPanel leftPanel = new JPanel();
-        leftPanel.setLayout(new BoxLayout(leftPanel, BoxLayout.Y_AXIS));
-        leftPanel.setBackground(new Color(24, 24, 37));
-        leftPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
-        leftPanel.setPreferredSize(new Dimension(170, 0)); 
 
-        JLabel toolsLabel = new JLabel("Команды:");
-        toolsLabel.setForeground(accentColor);
-        toolsLabel.setFont(new Font("Arial", Font.BOLD, 12));
-        toolsLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
-        leftPanel.add(toolsLabel);
-        leftPanel.add(Box.createRigidArea(new Dimension(0, 15)));
-
-        addQuickButton(leftPanel, "SELECT *", "SELECT * FROM students;");
-        addQuickButton(leftPanel, "Вставить", "INSERT INTO students VALUES (1, 'Иван', '25КНТ-1');");
-        addQuickButton(leftPanel, "Удалить", "DELETE FROM students WHERE id = 1;");
-        addQuickButton(leftPanel, "Обновить", "UPDATE students SET name = 'Петр' WHERE id = 2;");
-        addQuickButton(leftPanel, "Создать табл.", "CREATE TABLE cars (id INT PRIMARY KEY, brand STRING, price FLOAT);");
-        addQuickButton(leftPanel, "Удалить табл.", "DROP TABLE cars;");
-        addQuickButton(leftPanel, "Создать индекс", "CREATE INDEX idx_name ON students (name);");
         
-        leftPanel.add(Box.createVerticalGlue());
 
-        JButton clearBtn = new JButton("Очистить окно");
-        clearBtn.setBackground(errorColor);
-        clearBtn.setForeground(bgColor);
-        clearBtn.setFocusPainted(false);
-        clearBtn.setMaximumSize(new Dimension(150, 35));
-        clearBtn.setAlignmentX(Component.CENTER_ALIGNMENT);
-        clearBtn.addActionListener(e -> {
-            queryField.setText("");
-            tableModel.setRowCount(0);
-            statusArea.setText("Окно очищено.");
-            statusArea.setForeground(textColor);
-        });
-        leftPanel.add(clearBtn);
 
         //Верхняя панель (Ввод)
         JPanel topPanel = new JPanel(new BorderLayout(10, 10));
@@ -122,8 +88,26 @@ public class DatabaseGUI extends JFrame {
         inputPanel.add(queryField, BorderLayout.CENTER);
         inputPanel.add(executeBtn, BorderLayout.EAST);
 
+
         topPanel.add(historyWrapper, BorderLayout.WEST);
         topPanel.add(inputPanel, BorderLayout.CENTER);
+
+        // Очистка
+        JButton clearBtn = new JButton("Очистить");
+        clearBtn.setBackground(errorColor);
+        clearBtn.setForeground(bgColor);
+        clearBtn.setFocusPainted(false);
+        clearBtn.addActionListener(e -> {
+            queryField.setText("");
+            tableModel.setRowCount(0);
+            statusArea.setText("Окно очищено.");
+            statusArea.setForeground(textColor);
+        });
+
+        JPanel rightButtonsPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
+        rightButtonsPanel.setBackground(bgColor);
+        rightButtonsPanel.add(clearBtn);
+        inputPanel.add(rightButtonsPanel, BorderLayout.EAST);
 
         //Таблица(Центр)
         tableModel = new DefaultTableModel();
@@ -156,7 +140,6 @@ public class DatabaseGUI extends JFrame {
         statusScroll.setBorder(BorderFactory.createEmptyBorder(0, 10, 10, 10));
 
         //Размещение элементов
-        add(leftPanel, BorderLayout.WEST);
         add(topPanel, BorderLayout.NORTH);
         add(scrollPane, BorderLayout.CENTER);
         add(statusScroll, BorderLayout.SOUTH);
@@ -166,20 +149,6 @@ public class DatabaseGUI extends JFrame {
         queryField.addActionListener(e -> executeQuery(queryField.getText()));
     }
 
-    private void addQuickButton(JPanel panel, String title, String sqlCommand) {
-        JButton btn = new JButton(title);
-        btn.setBackground(panelColor);
-        btn.setForeground(textColor);
-        btn.setFocusPainted(false);
-        btn.setMaximumSize(new Dimension(150, 35));
-        btn.setAlignmentX(Component.CENTER_ALIGNMENT);
-        btn.addActionListener(e -> {
-            queryField.setText(sqlCommand);
-            //executeQuery(sqlCommand);
-        });
-        panel.add(btn);
-        panel.add(Box.createRigidArea(new Dimension(0, 10)));
-    }
 
     //Главный метод связки с остальными файлами
     private void executeQuery(String sql) {
