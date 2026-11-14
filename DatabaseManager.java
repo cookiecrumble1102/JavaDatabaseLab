@@ -277,7 +277,7 @@ public class DatabaseManager
 
 
             String dbFilePath = directoryPath + File.separator + dbName + ".db";
-            String indexFilePath = directoryPath + File.separator + dbName + "_" + columns.get(0).getName() + ".idx";
+            String indexFilePath = directoryPath + File.separator + dbName + "." + columns.get(0).getName() + ".idx";
             File dbFile = new File(dbFilePath);
             File indexFile = new File(indexFilePath);
 

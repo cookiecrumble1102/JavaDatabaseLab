@@ -162,7 +162,7 @@ public class DataTable
 
             column.setIndexed(false);
 
-            String indexPath = directoryPath + File.separator + name + "_" + column.getName() + ".idx";
+            String indexPath = directoryPath + File.separator + name + "." + column.getName() + ".idx";
 
             File indexFile = new File(indexPath);
 
